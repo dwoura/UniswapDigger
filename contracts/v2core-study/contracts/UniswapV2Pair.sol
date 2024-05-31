@@ -9,6 +9,7 @@ import './interfaces/IUniswapV2Factory.sol';
 import './interfaces/IUniswapV2Callee.sol';
 
 // 基本公式 x*y=k, 实际逻辑上会对公式有一些变形
+// 注意常数 k 用两资产数量乘积表示，而流动性数量liquidity用两资产数量乘积的开平方表示。
 contract UniswapV2Pair is IUniswapV2Pair, UniswapV2ERC20 {
     using SafeMath  for uint;
     using UQ112x112 for uint224; // 定点数，把 UQ112x112 库绑定到 uint224 类型，这样可以在 uint224类型的变量上直接调用如.encode().decode()库函数。
@@ -46,10 +47,18 @@ contract UniswapV2Pair is IUniswapV2Pair, UniswapV2ERC20 {
     // 若要计算t1到t2时刻的TWAP价格（时间加权平均价格），外部可以检查t1和t2时间的累加器的值，通过后值减去前值，再除以期间经过的秒数，就可以计算出以秒为单位的TWAP价格
     //   补充：合约本身不记录历史累加值，只有最新的累加值，要在链下记录历史累加值。
     uint public price0CumulativeLast; // 记录的是 Token0对Token1的累计价格
+    // 某段时间内用 B 计算的 A 的均价不一定等于用 A 计算 B 均价的倒数。
+    // 例如，USDT/ETH 在区块1中价格为100，在区块2中为300，则 USDT/ETH 的均价为200。
+    // 但ETH/USDT的均价有可能是1/150，可以知道他们的均价并非倒数关系。 ？？？？这一块不太理解为什么
+    // 因此两个方向的价格都要都要追踪，用户自行选用。
     uint public price1CumulativeLast; // 记录的是 Token1对Token0的累计价格
+
+    // 最近一次的缓存余额的乘积，计算常数K，用于计算费率 
+    // kLast记录的是上一次交易时的两种资产数量的乘积
     uint public kLast; // reserve0 * reserve1, as of immediately after the most recent liquidity event
 
     uint private unlocked = 1;
+    // 锁定修饰器，为函数加锁
     modifier lock() {
         require(unlocked == 1, 'UniswapV2: LOCKED');
         unlocked = 0;
@@ -57,6 +66,7 @@ contract UniswapV2Pair is IUniswapV2Pair, UniswapV2ERC20 {
         unlocked = 1;
     }
 
+    // 一次查询出来比单独查询出来要节省 gas
     function getReserves() public view returns (uint112 _reserve0, uint112 _reserve1, uint32 _blockTimestampLast) {
         _reserve0 = reserve0;
         _reserve1 = reserve1;
@@ -89,6 +99,7 @@ contract UniswapV2Pair is IUniswapV2Pair, UniswapV2ERC20 {
     }
 
     // called once by the factory at time of deployment
+    // 部署时，工厂合约会调用这个方法
     function initialize(address _token0, address _token1) external {
         require(msg.sender == factory, 'UniswapV2: FORBIDDEN'); // sufficient check
         token0 = _token0;
@@ -133,25 +144,44 @@ contract UniswapV2Pair is IUniswapV2Pair, UniswapV2ERC20 {
     }
 
     // this low-level function should be called from a contract which performs important safety checks
+    // 这个低级函数应被call在执行安全检查的合约里
+    // 外部函数，铸造流动性代币lp，并发送到指定的 to 地址里
+    // 返回值 liquidity 是所要铸造流动性代币的数量
     function mint(address to) external lock returns (uint liquidity) {
-        (uint112 _reserve0, uint112 _reserve1,) = getReserves(); // gas savings
-        uint balance0 = IERC20(token0).balanceOf(address(this));
+        // 这种读变量的方式能够减少存储（slot）读取的操作。 ？？？
+        (uint112 _reserve0, uint112 _reserve1,) = getReserves(); // 省 gas
+        // this是调用函数的合约的实例。一个合约可以有多个实例
+        // 作用是读取本合约里有多少 token0 和 token1的数量
+        uint balance0 = IERC20(token0).balanceOf(address(this)); // address(this)表示本pair合约地址
         uint balance1 = IERC20(token1).balanceOf(address(this));
+        // 现有余额减去缓存余额，通过算出差值可以知道比上次增加了多少数量，用于计算外部加了lp多少数量。
         uint amount0 = balance0.sub(_reserve0);
         uint amount1 = balance1.sub(_reserve1);
 
+        // 传入缓存余额，计算手续费
         bool feeOn = _mintFee(_reserve0, _reserve1);
+        // 可节约gas，_mintFee函数执行后会使得总供应（总流动性）变化，因此_totalSupply变量应在变化后读取，避免重复读取。
         uint _totalSupply = totalSupply; // gas savings, must be defined here since totalSupply can update in _mintFee
         if (_totalSupply == 0) {
-            liquidity = Math.sqrt(amount0.mul(amount1)).sub(MINIMUM_LIQUIDITY);
-           _mint(address(0), MINIMUM_LIQUIDITY); // permanently lock the first MINIMUM_LIQUIDITY tokens
+            // 如果该 pair 没有流动性，则算出流动性后进行铸造
+            liquidity = Math.sqrt(amount0.mul(amount1)).sub(MINIMUM_LIQUIDITY); // 用开方的形式表示流动性数量
+           // 初始流动性的创建，要先给0地址铸造最小流动性
+           _mint(address(0), MINIMUM_LIQUIDITY); // permanently lock the first MINIMUM_LIQUIDITY tokens 永久锁定第一个最小流动性
         } else {
+            // 若该 pair 已经存在了流动性
+            // 应该是 _totalSupply * (amount/_reserve) ， 计算加 lp 的数量占原池子余额的占比，再乘上总供应数量，即可得出需要增发的交易对token数量liquidity
+            // 选用较小值可以保证交易对比例。如果选用较大值，另一种资产数量不够，导致比例失衡。
+            // 可能会存在另一种 token 出现多余的数额，会在外围合约里的addLiquidity函数里进行退还。  ！！！具体实现暂未了解，这块还要继续研究。！！！
             liquidity = Math.min(amount0.mul(_totalSupply) / _reserve0, amount1.mul(_totalSupply) / _reserve1);
         }
         require(liquidity > 0, 'UniswapV2: INSUFFICIENT_LIQUIDITY_MINTED');
+        // 确保新铸造的流动性份额大于零后，给创建者地址铸造对应流动性数额的池子 token
+        // 给目标地址，增发对应流动性数额
         _mint(to, liquidity);
 
+        // 更新缓存余额、累加值。现有余额在计算后并入流动性，成为缓存余额
         _update(balance0, balance1, _reserve0, _reserve1);
+        // 如果费率开启了，则还需要更新最近常数k，因为
         if (feeOn) kLast = uint(reserve0).mul(reserve1); // reserve0 and reserve1 are up-to-date
         emit Mint(msg.sender, amount0, amount1);
     }
