@@ -123,17 +123,24 @@ contract UniswapV2Pair is IUniswapV2Pair, UniswapV2ERC20 {
     }
 
     // if fee is on, mint liquidity equivalent to 1/6th of the growth in sqrt(k)
+    // 如果协议手续费启用，fee 就等于Δk（根号k2-根号k1）的1/6。从 lp 提供者千三的手续费里抽取1/6
+    // 因为有 fee 的存在，会导致 k 变大，增长的部分即为总手续费。在总手续费里可以划分出那1/6的协议手续费
+    // V2有0.05%的协议手续费可以选择打开与关闭，打开的话协议手续费会发送到 factory 合约指定的 feeTo 地址
     function _mintFee(uint112 _reserve0, uint112 _reserve1) private returns (bool feeOn) {
         address feeTo = IUniswapV2Factory(factory).feeTo();
         feeOn = feeTo != address(0);
-        uint _kLast = kLast; // gas savings
+        uint _kLast = kLast; // gas savings 局部缓存变量，节省 gas
         if (feeOn) {
             if (_kLast != 0) {
+                // 计算根号k和根号kLast
                 uint rootK = Math.sqrt(uint(_reserve0).mul(_reserve1));
                 uint rootKLast = Math.sqrt(_kLast);
                 if (rootK > rootKLast) {
+                    // 当 k 有增量时, 需要为这些费率增发流动性 token
+                    // 下面两个是fee 计算公式，分别是分子与分母
                     uint numerator = totalSupply.mul(rootK.sub(rootKLast));
                     uint denominator = rootK.mul(5).add(rootKLast);
+                    // 计算出需要增发的流动性
                     uint liquidity = numerator / denominator;
                     if (liquidity > 0) _mint(feeTo, liquidity);
                 }
@@ -181,68 +188,109 @@ contract UniswapV2Pair is IUniswapV2Pair, UniswapV2ERC20 {
 
         // 更新缓存余额、累加值。现有余额在计算后并入流动性，成为缓存余额
         _update(balance0, balance1, _reserve0, _reserve1);
-        // 如果费率开启了，则还需要更新最近常数k，因为
+        // 如果费率开启了，则还需要更新最近常数k，为缓存余额的乘积
+        // 为什么不直接用 balance0*balance1？？？ 
         if (feeOn) kLast = uint(reserve0).mul(reserve1); // reserve0 and reserve1 are up-to-date
         emit Mint(msg.sender, amount0, amount1);
     }
 
     // this low-level function should be called from a contract which performs important safety checks
+    // 销毁本池子合约里的所有份额（撤出流动性），并转出份额对应的 token0 和 token1给 to 地址。
+    //  补充：手续费实际上已在计算在份额内部，不需要单独计算手续费收益。
+    // 撤池子的流程一般是用户先把个人 lp 份额发到合约中，然后进行销毁，最后再把对应 token 发回给用户。
     function burn(address to) external lock returns (uint amount0, uint amount1) {
         (uint112 _reserve0, uint112 _reserve1,) = getReserves(); // gas savings
+        // 变量存入 memory 里节省 gas
         address _token0 = token0;                                // gas savings
         address _token1 = token1;                                // gas savings
+        // 获取 pair池子 在 token 里的真实余额
         uint balance0 = IERC20(_token0).balanceOf(address(this));
         uint balance1 = IERC20(_token1).balanceOf(address(this));
+        // 读取本pair的流动性
+        // 注意不是总供应量 totalSupply
+        // 因为要 burn 流动性，需要用户先转 lp 份额进来，因此这里获取的是当前pair流动性代币最新的数量
         uint liquidity = balanceOf[address(this)];
 
+        // 是否分发协议手续费给 lp 提供者，函数内会判断有没有设置 feeTo 来启停协议手续费
         bool feeOn = _mintFee(_reserve0, _reserve1);
         uint _totalSupply = totalSupply; // gas savings, must be defined here since totalSupply can update in _mintFee
+        // liquidity / _totalSupply 表示用户持有的pair token份额在总份额（总流动性）的占比，得出用户的“持股比例”
+        // 用池子中当前已有的 token 数量balance与“持股比例”相乘，即可得待转给用户的token数额
+        //  补充：由于等比例的关系，手续费已经包含在 amount 中，无需另外计算
         amount0 = liquidity.mul(balance0) / _totalSupply; // using balances ensures pro-rata distribution
         amount1 = liquidity.mul(balance1) / _totalSupply; // using balances ensures pro-rata distribution
+        // amount 为 0 说明没有池子可撤出
         require(amount0 > 0 && amount1 > 0, 'UniswapV2: INSUFFICIENT_LIQUIDITY_BURNED');
+        // 销毁本合约的所有份额
         _burn(address(this), liquidity);
         _safeTransfer(_token0, to, amount0);
         _safeTransfer(_token1, to, amount1);
+        // 重新获取最新余额
         balance0 = IERC20(_token0).balanceOf(address(this));
         balance1 = IERC20(_token1).balanceOf(address(this));
 
+        // 销毁完后数量状态发生变化，需要更新现有余额和缓存余额
         _update(balance0, balance1, _reserve0, _reserve1);
         if (feeOn) kLast = uint(reserve0).mul(reserve1); // reserve0 and reserve1 are up-to-date
         emit Burn(msg.sender, amount0, amount1, to);
     }
 
     // this low-level function should be called from a contract which performs important safety checks
+    // V2不同于V1，用户用 XYZ 买 ABC 时，不需要发送 XYZ 到合约才能收到 ABC。
+    // V2添加了一个特性，允许用户在支付输入资产前，先接收和使用输出资产，只需要保证他们在同一个原子的一笔交易中完成支付即可。
+    // swap 函数中，调用了一个可选的用户指定的回调合约，
+    // 回调完成后，合约会检查最新余额，并且确保 扣除手续费后的两token最新余额 的乘积k不减少。  补充：
+    // 合约资金不够的话，会回滚交易
     function swap(uint amount0Out, uint amount1Out, address to, bytes calldata data) external lock {
+        // 要求其中一个转出数额大于零才可以兑换
         require(amount0Out > 0 || amount1Out > 0, 'UniswapV2: INSUFFICIENT_OUTPUT_AMOUNT');
         (uint112 _reserve0, uint112 _reserve1,) = getReserves(); // gas savings
+        // 若其中一个 swap 数额超过缓存余额（池子深度），无法兑换
+        // 不能掏空池子，转出的数额需要小于缓存余额才可以兑换
         require(amount0Out < _reserve0 && amount1Out < _reserve1, 'UniswapV2: INSUFFICIENT_LIQUIDITY');
 
         uint balance0;
         uint balance1;
-        { // scope for _token{0,1}, avoids stack too deep errors
+        { // scope for _token{0,1}, avoids stack too deep errors 避免栈太深报错
+        //由于 EVM 的限制，每个函数调用时最多只能有 16 个局部变量在栈中（包括函数参数和返回值）。如果超过这个限制，会导致 "Stack too deep" 错误。
+        // 使用{...} ，可以在代码块结束后，优先销毁块中变量而释放空间。
         address _token0 = token0;
         address _token1 = token1;
+        // 转出地址 to 不能是 token0和 token1 的地址
         require(to != _token0 && to != _token1, 'UniswapV2: INVALID_TO');
+        // 输出代币大于零则转账对应 token 给 to 地址
+        // V3 一样支持闪电贷，就是token 可以先从 pair 合约转（借）出去
+        // 整体代码逻辑是可以先转账（不超过池子数额）到 to 地址，然后可以在回调函数里做一些事，结束后再还回来。当然回调函数里产生的手续费是要给的
         if (amount0Out > 0) _safeTransfer(_token0, to, amount0Out); // optimistically transfer tokens
         if (amount1Out > 0) _safeTransfer(_token1, to, amount1Out); // optimistically transfer tokens
-        if (data.length > 0) IUniswapV2Callee(to).uniswapV2Call(msg.sender, amount0Out, amount1Out, data);
+        // 当参数中的 data 有数据时，就能开启调用回调函数（闪电贷的逻辑写在内部）
+        if (data.length > 0) IUniswapV2Callee(to).uniswapV2Call(msg.sender, amount0Out, amount1Out, data); // 回调合约，在 interfaces 文件夹里可以找到
+        // 事情都干完后，数额状态发生了变化，因此要记录现有余额局部变量。
+        // 由于整体 swap 还没有敲定下来，因此更新的现有余额用的是局部变量
         balance0 = IERC20(_token0).balanceOf(address(this));
         balance1 = IERC20(_token1).balanceOf(address(this));
         }
+        // 
         uint amount0In = balance0 > _reserve0 - amount0Out ? balance0 - (_reserve0 - amount0Out) : 0;
         uint amount1In = balance1 > _reserve1 - amount1Out ? balance1 - (_reserve1 - amount1Out) : 0;
         require(amount0In > 0 || amount1In > 0, 'UniswapV2: INSUFFICIENT_INPUT_AMOUNT');
         { // scope for reserve{0,1}Adjusted, avoids stack too deep errors
+        // 扩大一千倍，避免浮点数运算
         uint balance0Adjusted = balance0.mul(1000).sub(amount0In.mul(3));
         uint balance1Adjusted = balance1.mul(1000).sub(amount1In.mul(3));
+        // 比较时也要同样各扩大一千倍相乘
         require(balance0Adjusted.mul(balance1Adjusted) >= uint(_reserve0).mul(_reserve1).mul(1000**2), 'UniswapV2: K');
         }
 
+        // 最后更新余额，发送事件完成 swap
         _update(balance0, balance1, _reserve0, _reserve1);
         emit Swap(msg.sender, amount0In, amount1In, amount0Out, amount1Out, to);
     }
 
     // force balances to match reserves
+    // 强制让现有余额和缓存余额相等，目的是防止有人直接转入代币而不是通过添加 lp 的方式转入所造成的xy 比例失衡
+    // skim()的作用是在发送代币数量溢出uint112大小的
+    // 任何人都可以调用这个函数，转走多余的代币，每次调用都会上锁。
     function skim(address to) external lock {
         address _token0 = token0; // gas savings
         address _token1 = token1; // gas savings
@@ -251,7 +299,11 @@ contract UniswapV2Pair is IUniswapV2Pair, UniswapV2ERC20 {
     }
 
     // force reserves to match balances
+    // 强制让现有余额和缓存余额相等，目的是防止有人直接转入代币而不是通过添加 lp 的方式转入所造成的xy 比例失衡
+    // skim 是取出多的代币平账，sync 是把多的代币算进流动性去（把缓存余额设置为现有余额）来平账
     function sync() external lock {
         _update(IERC20(token0).balanceOf(address(this)), IERC20(token1).balanceOf(address(this)), reserve0, reserve1);
     }
 }
+
+// 后续还要总结流程
